@@ -31,7 +31,9 @@ private:
     // UI components
 public:
     // Constructor
-    MyFrame() : wxFrame(nullptr, wxID_ANY, "File Manager", wxDefaultPosition, wxDefaultSize) {
+    MyFrame() : wxFrame(nullptr, wxID_ANY, "File Manager", wxDefaultPosition, wxSize(900, 600)) {
+        SetMinSize(wxSize(600, 400));
+
         wxMenu* fileMenu = new wxMenu;
         fileMenu->Append(wxID_EXIT, "E&xit\tCtrl-Q", "Exit the application");
        
@@ -51,10 +53,25 @@ public:
         wxBoxSizer* sizer = new wxBoxSizer(wxVERTICAL);
         panel->SetSizer(sizer);
 
-        // Create directory bar to search
+        // Create directory bar with an Up button to navigate to the parent directory
+        wxBoxSizer* dirSizer = new wxBoxSizer(wxHORIZONTAL);
+        wxButton* upButton = new wxButton(panel, wxID_ANY, "Up", wxDefaultPosition, wxSize(50, -1));
+        dirSizer->Add(upButton, 0, wxALL, 5);
+
         dirBar = new wxTextCtrl(panel, wxID_ANY, defaultDir,
                                             wxDefaultPosition, wxDefaultSize, wxTE_PROCESS_ENTER);
-        sizer->Add(dirBar, 0, wxEXPAND | wxALL, 5);
+        dirSizer->Add(dirBar, 1, wxEXPAND | wxALL, 5);
+        sizer->Add(dirSizer, 0, wxEXPAND);
+
+        // Navigate to the parent directory
+        upButton->Bind(wxEVT_BUTTON, [this](wxCommandEvent&) {
+            fs::path parent = fs::path(defaultDir).parent_path();
+            if (!parent.empty() && parent.string() != defaultDir) {
+                defaultDir = parent.string();
+                updateFile();
+                dirBar->SetValue(wxString(defaultDir));
+            }
+        });
 
         // Bind enter key event for directory bar
         Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent& event) {
@@ -103,6 +120,16 @@ public:
             }
         });
 
+        // Delete key removes the selected item, but only while the list has focus
+        // (so Delete/Backspace still edit text normally in the directory bar)
+        fileList->Bind(wxEVT_KEY_DOWN, [this](wxKeyEvent& event){
+            if (event.GetKeyCode() == WXK_DELETE) {
+                deleteItem();
+            } else {
+                event.Skip();
+            }
+        });
+
         // Set up Edit menu and shortcuts
         wxMenu* editMenu = new wxMenu;
         editMenu->Append(wxID_COPY, "&Copy\tCtrl-C");
@@ -117,10 +144,10 @@ public:
 
         // Set up Files menu with rename, new directory, delete, refresh
         wxMenu* filesMenu = new wxMenu;
-        filesMenu->Append(ID_RENAME, "&Rename");
+        filesMenu->Append(ID_RENAME, "&Rename\tF2");
         filesMenu->Append(ID_NEW_DIR, "&New Directory");
         filesMenu->Append(ID_DELETE_FILE, "&Delete");
-        filesMenu->Append(ID_REFRESH_FILES, "&Refresh");
+        filesMenu->Append(ID_REFRESH_FILES, "&Refresh\tF5");
         
         // Add Files menu to menu bar and bind events
         menuBar->Append(filesMenu, "&Files");
@@ -133,13 +160,43 @@ public:
         updateFile();
     }
 
+    // helper to format a byte count as a human-readable size
+    private:
+        std::string formatSize(uintmax_t size) {
+            static const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+            double s = static_cast<double>(size);
+            int unit = 0;
+            while (s >= 1024.0 && unit < 4) {
+                s /= 1024.0;
+                unit++;
+            }
+            std::ostringstream ss;
+            if (unit == 0) {
+                ss << size << " " << units[unit];
+            } else {
+                ss << std::fixed << std::setprecision(1) << s << " " << units[unit];
+            }
+            return ss.str();
+        }
+
     // Helper function to update file list based on current directory
     private:
     void updateFile() {
         fileList->DeleteAllItems();
 
+        // Open the directory without throwing, so an inaccessible path shows
+        // an error instead of crashing the app
+        std::error_code dirError;
+        fs::directory_iterator dirIt(defaultDir, dirError);
+        if (dirError) {
+            SetStatusText("Cannot open directory: " + wxString(dirError.message()));
+            return;
+        }
+
+        int dirCount = 0, fileCount = 0;
+
         // Iterate through directory entries
-        for (const auto& entry : fs::directory_iterator(defaultDir)) {
+        for (const auto& entry : dirIt) {
 
             // Get file/directory name
             std::string name = entry.path().filename().string();
@@ -156,12 +213,9 @@ public:
                 continue;
             }
 
-            // Check if it's a symlink
-            if (fs::is_symlink(status)) {
-                fileList->SetItem(i, 1, "?");
-                fileList->SetItem(i, 2, "Link");
-            }
+            bool isSymlink = fs::is_symlink(status);
 
+            // isDir follows symlinks to check the target
             bool isDir = fs::is_directory(entry.path(), error);
             if (error) {
                 fileList->SetItem(i, 1, "?");
@@ -171,31 +225,33 @@ public:
 
             // Set size and type based on whether it's a directory or file
             if (isDir) {
-                fileList->SetItem(i, 1, "0");
-                fileList->SetItem(i, 2, "Dir");
+                fileList->SetItem(i, 1, "--");
+                fileList->SetItem(i, 2, isSymlink ? "Link" : "Dir");
+                dirCount++;
             }
             else {
                 auto size = fs::file_size(entry.path(), error);
                 if (error) {
                     fileList->SetItem(i, 1, "?");
-                } 
+                }
                 else {
-                    fileList->SetItem(i, 1, std::to_string(size));
+                    fileList->SetItem(i, 1, formatSize(size));
                 }
 
                 std::string ext = entry.path().extension().string();
-                fileList->SetItem(i, 2, ext.empty() ? "File" : ext);
+                fileList->SetItem(i, 2, isSymlink ? "Link" : (ext.empty() ? "File" : ext));
+                fileCount++;
             }
 
             // Get and format last modified time
-            auto modified = entry.last_write_time(error);
+            auto writeTime = entry.last_write_time(error);
             if(error){
                 fileList->SetItem(i, 3, "?");
             }
             // convert file_time_type to system_clock::time_point
             else{
                 auto sys_clock = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    modified - fs::file_time_type::clock::now()
+                    writeTime - fs::file_time_type::clock::now()
                     + std::chrono::system_clock::now()
                 );
                 // Format time to string
@@ -203,10 +259,11 @@ public:
                 std::tm* tm = std::localtime(&time);
                 std::ostringstream ss;
                 ss << std::put_time(tm, "%Y-%m-%d %H:%M:%S");
-                std::string modified = ss.str();
-                fileList->SetItem(i, 3, modified);
+                fileList->SetItem(i, 3, ss.str());
             }
         }
+
+        SetStatusText(wxString::Format("%d folder(s), %d file(s)", dirCount, fileCount));
     }
 
     // helper function to get selected item path
@@ -265,6 +322,17 @@ public:
             }
             // construct full path for paste destination
             std::string fullPath = defaultDir + "/" + fs::path(clipboard).filename().string();
+
+            std::error_code opError;
+
+            // pasting a cut item back into its own location is a no-op; check this
+            // first (using the non-throwing overload, since fullPath may not exist
+            // yet) so we don't delete the source below and then fail to move it
+            if(isCut && fs::equivalent(clipboard, fullPath, opError) && !opError){
+                SetStatusText("Item is already in this location");
+                return;
+            }
+
             // overwrite confirmation
             if(fs::exists(fullPath)){
                 if(wxMessageBox("File exists. Overwrite?", "Confirm", wxYES_NO | wxICON_QUESTION) != wxYES){
@@ -272,35 +340,36 @@ public:
                 }
                 // remove existing file or directory
                 else{
-                    std::error_code error;
-                    fs::remove_all(fullPath, error);
-                    if(error){
-                        SetStatusText("Error overwriting file: " + wxString(error.message()));
+                    fs::remove_all(fullPath, opError);
+                    if(opError){
+                        SetStatusText("Error overwriting file: " + wxString(opError.message()));
                         return;
                     }
                 }
             }
             // if is cut then move file
             if(isCut){
-                // prevent moving to same location
-                if (fs::equivalent(clipboard, fullPath)) {
-                    SetStatusText("error, item already in this location");
+                // move file or directory
+                fs::rename(clipboard, fullPath, opError);
+                if(opError){
+                    wxMessageBox("Error moving item: " + wxString(opError.message()), "Error", wxICON_ERROR);
                     return;
                 }
-
-                // move file or directory
-                fs::rename(clipboard, fullPath);
                 SetStatusText("Moved to: " + wxString(fullPath));
             }
             // else copy file or directory
             else {
                 // if directory copy recursively
                 if(fs::is_directory(clipboard)){
-                    fs::copy(clipboard, fullPath, fs::copy_options::recursive);
+                    fs::copy(clipboard, fullPath, fs::copy_options::recursive, opError);
                 }
                 // else copy file
                 else{
-                    fs::copy(clipboard, fullPath);
+                    fs::copy(clipboard, fullPath, opError);
+                }
+                if(opError){
+                    wxMessageBox("Error copying item: " + wxString(opError.message()), "Error", wxICON_ERROR);
+                    return;
                 }
             }
             // clear clipboard and update file list
@@ -332,7 +401,12 @@ public:
                     return;
                 }
                 // perform rename and update file list
-                fs::rename(path, newPath);
+                std::error_code error;
+                fs::rename(path, newPath, error);
+                if(error){
+                    wxMessageBox("Error renaming item: " + wxString(error.message()), "Error", wxICON_ERROR);
+                    return;
+                }
                 updateFile();
                 SetStatusText("Renamed to: " + wxString(text.GetValue()));
             }
@@ -353,7 +427,12 @@ public:
                     return;
                 }
                 // else create directory and update file list
-                fs::create_directory(newDirPath);
+                std::error_code error;
+                fs::create_directory(newDirPath, error);
+                if(error){
+                    wxMessageBox("Error creating directory: " + wxString(error.message()), "Error", wxICON_ERROR);
+                    return;
+                }
                 updateFile();
                 SetStatusText("Created directory: " + wxString(newDirPath));
             }
@@ -392,19 +471,13 @@ public:
             SetStatusText("Refreshed");
         }
 
-    // exit application
-    private:
-        void Exit(wxCommandEvent& event) {
-            Close(true);
-        }
-
     // member variables
     private:
         std::string defaultDir = wxGetHomeDir().ToStdString();
         wxListCtrl* fileList = nullptr;
         wxTextCtrl* dirBar = nullptr;
         std::string clipboard;
-        bool isCut;
+        bool isCut = false;
 };
 
 // implement application
